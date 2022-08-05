@@ -2,7 +2,8 @@
 import math
 import json
 import copy
-from typing import List, Dict
+from typing import List, Dict, Tuple
+from torch import Tensor
 import numpy as np
 import torch
 from torch import nn
@@ -14,6 +15,7 @@ from detectron2.structures import Instances, Boxes
 from detectron2.modeling import detector_postprocess
 from detectron2.utils.comm import get_world_size
 from detectron2.config import configurable
+from detectron2.layers.wrappers import shapes_to_tensor
 
 from ..layers.heatmap_focal_loss import heatmap_focal_loss_jit
 from ..layers.heatmap_focal_loss import binary_heatmap_focal_loss_jit
@@ -26,6 +28,24 @@ from .centernet_head import CenterNetHead
 __all__ = ["CenterNet"]
 
 INF = 100000000
+
+@torch.jit._script_if_tracing
+def _cond_topk(
+    per_candidate_inds_sum: Tensor,
+    per_pre_nms_top_n: int,
+    per_box_cls: Tensor,
+    per_class: Tensor,
+    per_box_regression: Tensor,
+    per_grids: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    if per_candidate_inds_sum > per_pre_nms_top_n:
+        per_box_cls, top_k_indices = per_box_cls.topk(per_pre_nms_top_n, sorted=False)
+        per_class = per_class[top_k_indices]
+        per_box_regression = per_box_regression[top_k_indices]
+        per_grids = per_grids[top_k_indices]
+        return per_box_cls, per_class, per_box_regression, per_grids
+    return per_box_cls, per_class, per_box_regression, per_grids
+
 
 @PROPOSAL_GENERATOR_REGISTRY.register()
 class CenterNet(nn.Module):
@@ -185,14 +205,14 @@ class CenterNet(nn.Module):
         clss_per_level, reg_pred_per_level, agn_hm_pred_per_level = \
             self.centernet_head(features)
         grids = self.compute_grids(features)
-        shapes_per_level = grids[0].new_tensor(
-                    [(x.shape[2], x.shape[3]) for x in reg_pred_per_level])
         
         if not self.training:
             return self.inference(
                 images, clss_per_level, reg_pred_per_level, 
                 agn_hm_pred_per_level, grids)
         else:
+            shapes_per_level = grids[0].new_tensor(
+                        [(x.shape[2], x.shape[3]) for x in reg_pred_per_level])
             pos_inds, labels, reg_targets, flattened_hms = \
                 self._get_ground_truth(
                     grids, shapes_per_level, gt_instances)
@@ -254,6 +274,7 @@ class CenterNet(nn.Module):
             M: number of pixels from all FPN levels
             C: number of classes
         '''
+        assert False
         assert (torch.isfinite(reg_pred).all().item())
         num_pos_local = pos_inds.numel()
         num_gpus = get_world_size()
@@ -353,7 +374,7 @@ class CenterNet(nn.Module):
             N: number of objects in all images
             M: number of pixels from all FPN levels
         '''
-
+        assert False
         # get positive pixel index
         if not self.more_pos:
             pos_inds, labels = self._get_label_inds(
@@ -449,6 +470,7 @@ class CenterNet(nn.Module):
             pos_inds: N'
             labels: N'
         '''
+        assert False
         pos_inds = []
         labels = []
         L = len(self.strides)
@@ -545,6 +567,7 @@ class CenterNet(nn.Module):
         return:
           heatmaps: M x C
         '''
+        assert False
         heatmaps = dist.new_zeros((dist.shape[0], channels))
         for c in range(channels):
             inds = (labels == c) # N
@@ -563,6 +586,7 @@ class CenterNet(nn.Module):
         return:
           heatmaps: M x 1
         '''
+        assert False
         heatmaps = dist.new_zeros((dist.shape[0], 1))
         heatmaps[:, 0] = torch.exp(-dist.min(dim=1)[0])
         zeros = heatmaps < 1e-4
@@ -571,6 +595,7 @@ class CenterNet(nn.Module):
 
 
     def _flatten_outputs(self, clss, reg_pred, agn_hm_pred):
+        assert False
         # Reshape: (N, F, Hl, Wl) -> (N, Hl, Wl, F) -> (sum_l N*Hl*Wl, F)
         clss = cat([x.permute(0, 2, 3, 1).reshape(-1, x.shape[1]) \
             for x in clss], dim=0) if clss[0] is not None else None
@@ -588,6 +613,7 @@ class CenterNet(nn.Module):
             centers: N x 2
             strides: M
         '''
+        assert False
         M, N = locations.shape[0], centers.shape[0]
         locations_expanded = locations.view(M, 1, 2).expand(M, N, 2) # M x N x 2
         centers_expanded = centers.view(1, N, 2).expand(M, N, 2) # M x N x 2
@@ -653,6 +679,7 @@ class CenterNet(nn.Module):
         self, grids, heatmap, reg_pred, image_sizes, agn_hm, level, 
         is_proposal=False):
         N, C, H, W = heatmap.shape
+        assert N == C == 1
         # put in the same format as grids
         if self.center_nms:
             heatmap_nms = nn.functional.max_pool2d(
@@ -689,13 +716,20 @@ class CenterNet(nn.Module):
 
             per_pre_nms_top_n = pre_nms_top_n[i] # 1
 
-            if per_candidate_inds.sum().item() > per_pre_nms_top_n.item():
-                per_box_cls, top_k_indices = \
-                    per_box_cls.topk(per_pre_nms_top_n, sorted=False)
-                per_class = per_class[top_k_indices]
-                per_box_regression = per_box_regression[top_k_indices]
-                per_grids = per_grids[top_k_indices]
-            
+            n = per_candidate_nonzeros.shape[0]
+            assert per_candidate_inds.sum() == n
+            # if per_candidate_inds.sum().item() > per_pre_nms_top_n.item():
+            #     per_box_cls, top_k_indices = \
+            #         per_box_cls.topk(per_pre_nms_top_n, sorted=False)
+            #     per_class = per_class[top_k_indices]
+            #     per_box_regression = per_box_regression[top_k_indices]
+            #     per_grids = per_grids[top_k_indices]
+
+            per_box_cls, per_class, per_box_regression, per_grids = _cond_topk(
+                n, per_pre_nms_top_n, 
+                per_box_cls, per_class, per_box_regression, per_grids
+            )
+
             detections = torch.stack([
                 per_grids[:, 0] - per_box_regression[:, 0],
                 per_grids[:, 1] - per_box_regression[:, 1],
@@ -709,6 +743,7 @@ class CenterNet(nn.Module):
             boxlist = Instances(image_sizes[i])
             boxlist.scores = torch.sqrt(per_box_cls) \
                 if self.with_agn_hm else per_box_cls # n
+
             # import pdb; pdb.set_trace()
             boxlist.pred_boxes = Boxes(detections)
             boxlist.pred_classes = per_class
@@ -719,6 +754,7 @@ class CenterNet(nn.Module):
     @torch.no_grad()
     def nms_and_topK(self, boxlists, nms=True):
         num_images = len(boxlists)
+        assert num_images == 1
         results = []
         for i in range(num_images):
             nms_thresh = self.nms_thresh_train if self.training else \
@@ -727,18 +763,31 @@ class CenterNet(nn.Module):
             if self.debug:
                 print('#proposals before nms', len(boxlists[i]))
                 print('#proposals after nms', len(result))
-            num_dets = len(result)
             post_nms_topk = self.post_nms_topk_train if self.training else \
                 self.post_nms_topk_test
-            if num_dets > post_nms_topk:
-                cls_scores = result.scores
-                image_thresh, _ = torch.kthvalue(
-                    cls_scores.float().cpu(),
-                    num_dets - post_nms_topk + 1
-                )
-                keep = cls_scores >= image_thresh.item()
-                keep = torch.nonzero(keep).squeeze(1)
-                result = result[keep]
+
+            # TorchVision NMS always sorts
+            #  should wait to clarify https://github.com/onnx/onnx/issues/4414 regardign sorting, but I think implementations do sort same as TorchVision
+            result = result[:post_nms_topk]
+
+            # cls_scores = result.scores
+            # if torch.jit.is_tracing():
+            #     num_dets = shapes_to_tensor(cls_scores.shape)[0]
+            #     assert len(result) == num_dets
+            #     num_dets = torch.min(num_dets, torch.as_tensor(post_nms_topk, device=num_dets.device))
+            #     _, keep = cls_scores.topk(num_dets, sorted=False)
+            #     result = result[keep]
+            # else:
+            #     num_dets = len(result)
+            #     if num_dets > post_nms_topk:
+            #         image_thresh, _ = torch.kthvalue(
+            #             # cls_scores.float().cpu(),
+            #             cls_scores,
+            #             num_dets - post_nms_topk + 1
+            #         )
+            #         keep = cls_scores >= image_thresh
+            #         keep = torch.nonzero(keep).squeeze(1)
+            #         result = result[keep]
             if self.debug:
                 print('#proposals after filter', len(result))
             results.append(result)
@@ -747,6 +796,7 @@ class CenterNet(nn.Module):
     
     @torch.no_grad()
     def _add_more_pos(self, reg_pred, gt_instances, shapes_per_level):
+        assert False
         labels, level_masks, c33_inds, c33_masks, c33_regs = \
             self._get_c33_inds(gt_instances, shapes_per_level)
         N, L, K = labels.shape[0], len(self.strides), 9
@@ -787,6 +837,7 @@ class CenterNet(nn.Module):
             gt_instances: [n_i], sum n_i = N
             shapes_per_level: L x 2 [(h_l, w_l)]_L
         '''
+        assert False
         labels = []
         level_masks = []
         c33_inds = []
